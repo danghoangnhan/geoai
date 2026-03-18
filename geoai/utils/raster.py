@@ -1876,3 +1876,237 @@ def clean_instance_mask(
         dst.write(cleaned, 1)
 
     return output_path
+
+
+def raster_mask_to_linestrings(
+    raster_path: str,
+    output_path: Optional[str] = None,
+    band: int = 1,
+    threshold: float = 0,
+    min_length: float = 0.0,
+    simplify_tolerance: Optional[float] = None,
+    output_format: str = "gpkg",
+) -> gpd.GeoDataFrame:
+    """Convert a binary raster mask to LineString geometries via skeletonization.
+
+    Reads a raster mask (e.g., road segmentation output), skeletonizes it to
+    extract centerlines, and converts the skeleton to LineString geometries
+    in a GeoDataFrame with the raster's CRS. Automatically uses GPU
+    acceleration via ``cucim``/``cupy`` when available, falling back to
+    CPU-based ``scikit-image``.
+
+    Args:
+        raster_path (str): Path to the input raster mask (GeoTIFF).
+        output_path (str, optional): Path to save the output vector file.
+            If None, returns the GeoDataFrame without saving.
+        band (int): Band number to read (1-based). Defaults to 1.
+        threshold (float): Pixel values greater than this threshold are treated
+            as foreground. Defaults to 0.
+        min_length (float): Minimum line length in map units to keep. Lines
+            shorter than this are discarded. Defaults to 0.0.
+        simplify_tolerance (float, optional): Tolerance for Douglas-Peucker
+            geometry simplification. None for no simplification.
+        output_format (str): Format for output file - 'geojson', 'shapefile',
+            'gpkg'. Auto-detected from the file extension of output_path when
+            possible. Defaults to 'gpkg'.
+
+    Returns:
+        geopandas.GeoDataFrame: A GeoDataFrame containing LineString geometries
+            in the raster's coordinate reference system.
+
+    Example:
+        >>> from geoai.utils.raster import raster_mask_to_linestrings
+        >>> gdf = raster_mask_to_linestrings("road_mask.tif", min_length=10.0)
+        >>> gdf.head()
+    """
+    with rasterio.open(raster_path) as src:
+        data = src.read(band)
+        transform = src.transform
+        crs = src.crs
+
+    # Binarize
+    binary = data > threshold
+
+    # Skeletonize — use GPU (cucim) when available, fall back to CPU (skimage)
+    try:
+        import cupy as cp
+        from cucim.skimage.morphology import skeletonize as _skeletonize_gpu
+
+        binary_gpu = cp.asarray(binary)
+        skeleton = cp.asnumpy(_skeletonize_gpu(binary_gpu))
+    except ImportError:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                warnings.warn(
+                    "GPU is available but cucim/cupy are not installed. "
+                    "Falling back to CPU skeletonization. Install GPU "
+                    "support with: pip install geoai-py[gpu]",
+                    stacklevel=2,
+                )
+        except ImportError:
+            pass
+
+        from skimage.morphology import skeletonize
+
+        skeleton = skeletonize(binary)
+
+    # Build a graph from skeleton pixels using 8-connectivity
+    lines = _skeleton_to_linestrings(skeleton, transform)
+
+    if not lines:
+        gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
+    else:
+        from shapely.geometry import MultiLineString
+        from shapely.ops import linemerge
+
+        # Merge collinear segments for cleaner geometry
+        merged = linemerge(MultiLineString(lines))
+
+        # Handle both single LineString and MultiLineString results
+        if merged.geom_type == "LineString":
+            geoms = [merged]
+        elif merged.geom_type == "MultiLineString":
+            geoms = list(merged.geoms)
+        else:
+            geoms = list(lines)
+
+        gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
+
+    # Filter by minimum length
+    if min_length > 0 and len(gdf) > 0:
+        gdf = gdf[gdf.geometry.length >= min_length].reset_index(drop=True)
+
+    # Simplify geometries
+    if simplify_tolerance is not None and len(gdf) > 0:
+        gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance)
+
+    # Save if output path provided
+    if output_path is not None and len(gdf) > 0:
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        ext = os.path.splitext(output_path)[1].lower()
+        if ext == ".geojson":
+            gdf.to_file(output_path, driver="GeoJSON")
+        elif ext in (".shp",):
+            gdf.to_file(output_path, driver="ESRI Shapefile")
+        else:
+            gdf.to_file(output_path, driver="GPKG")
+
+    return gdf
+
+
+def _skeleton_to_linestrings(
+    skeleton: np.ndarray,
+    transform,
+) -> list:
+    """Convert a boolean skeleton array to a list of LineString geometries.
+
+    Builds a graph from skeleton pixels using 8-connectivity, identifies
+    junction and endpoint nodes, and traces paths between them to create
+    LineString geometries in map coordinates.
+
+    Args:
+        skeleton (numpy.ndarray): Boolean 2D array where True pixels are
+            the skeleton.
+        transform: Rasterio affine transform for pixel-to-map conversion.
+
+    Returns:
+        list: A list of shapely LineString geometries.
+    """
+    from shapely.geometry import LineString
+
+    # Get skeleton pixel coordinates (row, col)
+    rows, cols = np.where(skeleton)
+    if len(rows) == 0:
+        return []
+
+    # Build adjacency using 8-connectivity
+    # Create a lookup set for fast neighbor checking
+    pixel_set = set(zip(rows.tolist(), cols.tolist()))
+
+    # Build adjacency list
+    neighbors_8 = [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ]
+    adjacency = {}
+    for r, c in pixel_set:
+        adj = []
+        for dr, dc in neighbors_8:
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in pixel_set:
+                adj.append((nr, nc))
+        adjacency[(r, c)] = adj
+
+    # Identify node types: endpoints (degree 1) and junctions (degree >= 3)
+    endpoints = set()
+    junctions = set()
+    for pixel, adj in adjacency.items():
+        degree = len(adj)
+        if degree == 1:
+            endpoints.add(pixel)
+        elif degree >= 3:
+            junctions.add(pixel)
+
+    nodes = endpoints | junctions
+
+    # If no nodes found (e.g., a closed loop), pick an arbitrary starting pixel
+    if not nodes and pixel_set:
+        nodes = {next(iter(pixel_set))}
+
+    # Trace paths between nodes
+    lines = []
+    visited_edges = set()
+
+    def _pixel_to_map(r, c):
+        """Convert pixel (row, col) to map coordinates using the affine transform."""
+        x, y = transform * (c + 0.5, r + 0.5)
+        return (x, y)
+
+    for node in nodes:
+        for neighbor in adjacency[node]:
+            edge_key = (min(node, neighbor), max(node, neighbor))
+            if edge_key in visited_edges:
+                continue
+
+            # Trace path from node through neighbor until we hit another node
+            path = [node, neighbor]
+            visited_edges.add(edge_key)
+            current = neighbor
+            previous = node
+
+            while current not in nodes or current == path[1]:
+                if current in nodes and current != path[1]:
+                    break
+                next_pixels = [p for p in adjacency[current] if p != previous]
+                if not next_pixels:
+                    break
+                if len(next_pixels) == 1:
+                    nxt = next_pixels[0]
+                else:
+                    # At a junction-like pixel, stop tracing
+                    break
+
+                edge_key = (min(current, nxt), max(current, nxt))
+                if edge_key in visited_edges:
+                    break
+                visited_edges.add(edge_key)
+                path.append(nxt)
+                previous = current
+                current = nxt
+
+            if len(path) >= 2:
+                coords = [_pixel_to_map(r, c) for r, c in path]
+                lines.append(LineString(coords))
+
+    return lines

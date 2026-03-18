@@ -41,6 +41,9 @@ building = ["buildingregulariser"]
 agents = ["strands-agents", "strands-agents-tools", "strands-agents[ollama]", "strands-agents[anthropic]", "strands-agents[openai]"]
 onnx = ["onnx", "onnxruntime"]
 sr = ["opensr-model"]
+network = ["neatnet; python_version>='3.11'", "scikit-image"]
+road = ["neatnet; python_version>='3.11'", "scikit-image"]
+gpu = ["cupy-cuda12x", "cucim-cu12"]
 
 [tool.distutils.bdist_wheel]
 universal = true

@@ -1030,3 +1030,94 @@ def smooth_vector(
     if output_path is not None:
         smoothed_vector_data.to_file(output_path)
     return smoothed_vector_data
+
+
+def polygons_to_line_network(
+    gdf: gpd.GeoDataFrame,
+    output_path: Optional[str] = None,
+    merge: bool = True,
+    min_length: float = 0.0,
+) -> gpd.GeoDataFrame:
+    """Convert polygon boundaries to a line network GeoDataFrame.
+
+    Extracts polygon boundaries as LineStrings and optionally merges
+    shared edges so that adjacent polygon boundaries (e.g., neighboring
+    field parcels) become a single line segment rather than duplicates.
+
+    This is useful as a preprocessing step before applying network
+    topology functions such as ``neatify_network()``, ``fix_topology()``,
+    or ``close_gaps()`` from :mod:`geoai.network`.
+
+    Args:
+        gdf (geopandas.GeoDataFrame): GeoDataFrame of Polygon or
+            MultiPolygon geometries.
+        output_path (str, optional): Path to save the output vector file.
+            Format is auto-detected from extension. If None, returns the
+            GeoDataFrame without saving.
+        merge (bool): Whether to merge collinear and shared boundary
+            segments using ``shapely.ops.linemerge``. Defaults to True.
+        min_length (float): Minimum line length in map units to keep.
+            Lines shorter than this are discarded. Defaults to 0.0.
+
+    Returns:
+        geopandas.GeoDataFrame: A GeoDataFrame of LineString geometries
+            representing the polygon boundary network.
+
+    Example:
+        >>> import geopandas as gpd
+        >>> from geoai.utils.vector import polygons_to_line_network
+        >>> fields = gpd.read_file("field_parcels.gpkg")
+        >>> boundary_network = polygons_to_line_network(fields, min_length=5.0)
+    """
+    from shapely.ops import linemerge, unary_union
+
+    if len(gdf) == 0:
+        return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+
+    # Extract boundaries as lines
+    boundaries = gdf.boundary
+
+    if merge:
+        # Merge all boundaries into a single geometry, then linemerge
+        # to combine shared edges into single segments
+        combined = unary_union(boundaries.geometry)
+        merged = linemerge(combined)
+
+        if merged.geom_type == "LineString":
+            geoms = [merged]
+        elif merged.geom_type == "MultiLineString":
+            geoms = list(merged.geoms)
+        else:
+            geoms = [g for g in merged.geoms if g.geom_type == "LineString"]
+    else:
+        # Explode all boundaries into individual LineStrings
+        geoms = []
+        for geom in boundaries.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            if geom.geom_type == "LineString":
+                geoms.append(geom)
+            elif geom.geom_type == "MultiLineString":
+                geoms.extend(geom.geoms)
+            elif geom.geom_type == "GeometryCollection":
+                for g in geom.geoms:
+                    if g.geom_type == "LineString":
+                        geoms.append(g)
+
+    result = gpd.GeoDataFrame(geometry=geoms, crs=gdf.crs)
+
+    # Filter by minimum length
+    if min_length > 0 and len(result) > 0:
+        result = result[result.geometry.length >= min_length].reset_index(drop=True)
+
+    if output_path is not None and len(result) > 0:
+        ext = os.path.splitext(output_path)[1].lower()
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        if ext == ".geojson":
+            result.to_file(output_path, driver="GeoJSON")
+        elif ext == ".shp":
+            result.to_file(output_path, driver="ESRI Shapefile")
+        else:
+            result.to_file(output_path, driver="GPKG")
+
+    return result

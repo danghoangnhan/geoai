@@ -66,6 +66,7 @@ from .raster import (
     masks_to_vector,
     mosaic_geotiffs,
     print_raster_info,
+    raster_mask_to_linestrings,
     raster_to_vector,
     raster_to_vector_batch,
     read_raster,
@@ -83,6 +84,7 @@ from .vector import (
     geojson_to_xy,
     get_vector_info,
     get_vector_info_ogr,
+    polygons_to_line_network,
     print_vector_info,
     smooth_vector,
     vector_to_geojson,
@@ -209,4 +211,6 @@ __all__ = [
     "flipnslide_augmentation",
     "export_flipnslide_tiles",
     "calc_f1_score",
+    "raster_mask_to_linestrings",
+    "polygons_to_line_network",
 ]

@@ -416,6 +416,13 @@ _LAZY_SYMBOL_MAP = {
     # --- geoai.water ---
     "segment_water": ("water", None),
     "BAND_ORDER_PRESETS": ("water", None),
+    # --- geoai.network ---
+    "extract_line_network": ("network", None),
+    "extract_road_network": ("network", None),
+    "neatify_network": ("network", None),
+    "close_gaps": ("network", None),
+    "extend_lines": ("network", None),
+    "fix_topology": ("network", None),
     # --- geoai.clip_classify ---
     "CLIPVectorClassifier": ("clip_classify", None),
     "clip_classify_vector": ("clip_classify", None),
